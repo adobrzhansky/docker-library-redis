@@ -19,6 +19,9 @@ inputs:
   registry_repository:
     description: 'Repository to push the image to'
     required: false
+  release_tag:
+    description: 'Release tag to build'
+    required: false
 
 runs:
   using: "composite"
@@ -95,14 +98,14 @@ runs:
         load: true
         platforms: ${{ inputs.platform }}
         tags: ${{ github.sha }}:${{ steps.platform.outputs.display_name }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+        cache-from: type=gha,scope=${{ inputs.distribution }}-${{ steps.platform.outputs.display_name }}
+        cache-to: type=gha,mode=max,scope=${{ inputs.distribution }}-${{ steps.platform.outputs.display_name }}
 
     - name: Save image
       shell: bash
       run: |
         docker save -o /tmp/image-${{ steps.platform.outputs.display_name }}.tar ${{ github.sha }}:${{ steps.platform.outputs.display_name }}
-    
+
     - name: Upload image
       uses: actions/upload-artifact@v4
       with:
@@ -115,7 +118,7 @@ runs:
       if: ${{ contains(fromJSON('["amd64", "i386", "arm64"]'), steps.platform.outputs.display_name) }}
       run: |
         docker run -d --name sanity-test-${{ steps.platform.outputs.display_name }} ${{ github.sha }}:${{ steps.platform.outputs.display_name }}
-    
+
     - name: Container Logs
       if: ${{ contains(fromJSON('["amd64", "i386", "arm64"]'), steps.platform.outputs.display_name) }}
       shell: bash
@@ -128,7 +131,7 @@ runs:
       run: |
         docker exec sanity-test-${{ steps.platform.outputs.display_name }} redis-cli ping
         docker exec sanity-test-${{ steps.platform.outputs.display_name }} redis-cli info server
-  
+
     - name: Verify installed modules
       if: ${{ contains(fromJSON('["amd64", "arm64"]'), steps.platform.outputs.display_name) }}
       shell: bash
@@ -148,7 +151,7 @@ runs:
           echo "The following modules are missing: ${missing_modules[*]}"
           exit 1
         fi
-  
+
     - name: Test RedisBloom
       if: ${{ contains(fromJSON('["amd64", "arm64"]'), steps.platform.outputs.display_name) }}
       shell: bash
@@ -158,7 +161,7 @@ runs:
         [ "$(docker exec sanity-test-${{ steps.platform.outputs.display_name }} redis-cli BF.EXISTS popular_keys "redis:hash")" = "1" ] || { echo "RedisBloom test failed: 'redis:hash' not found"; exit 1; }
         [ "$(docker exec sanity-test-${{ steps.platform.outputs.display_name }} redis-cli BF.EXISTS popular_keys "redis:list")" = "0" ] || { echo "RedisBloom test failed: 'redis:list' found unexpectedly"; exit 1; }
         echo "RedisBloom test passed successfully"
-      
+
     - name: Test RediSearch
       if: ${{ contains(fromJSON('["amd64", "arm64"]'), steps.platform.outputs.display_name) }}
       shell: bash
@@ -224,12 +227,44 @@ runs:
         path: test/report-entrypoint.xml
         reporter: java-junit
 
+    - name: Format registry tag
+      id: format-registry-tag
+      shell: bash
+      run: |
+        printf "tag=%s:%s%s-%s-%s" \
+          "${{ inputs.registry_repository }}" \
+          "${{ inputs.release_tag != '' && format('{0}-', inputs.release_tag || '') }}" \
+          "${{ github.sha }}" \
+          "${{ inputs.distribution }}" \
+          "${{ steps.platform.outputs.display_name }}" \
+          | tr '[:upper:]' '[:lower:]' >> "$GITHUB_OUTPUT"
+
     - name: Push image
       uses: docker/build-push-action@v6
       if: ${{ inputs.publish_image == 'true' && contains(fromJSON('["amd64", "arm64"]'), steps.platform.outputs.display_name) }}
       with:
         context: ${{ inputs.distribution }}
         push: true
-        tags: ${{ inputs.registry_repository }}:${{ github.sha }}-${{ inputs.distribution }}
+        tags: ${{ steps.format-registry-tag.outputs.tag }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
+
+    - name: Save image URL to artifact
+      shell: bash
+      run: |
+        if [[ "${{ inputs.publish_image }}" == "true" && "${{ contains(fromJSON('["amd64", "arm64"]'), steps.platform.outputs.display_name) }}" == "true" ]]; then
+          # Create a file with the image URL for this specific build
+          mkdir -p /tmp/image-urls
+          echo "${{ steps.format-registry-tag.outputs.tag }}" > "/tmp/image-urls/${{ inputs.distribution }}-${{ steps.platform.outputs.display_name }}.txt"
+          echo "Image URL saved: ${{ steps.format-registry-tag.outputs.tag }}"
+        else
+          echo "Image not published for this platform/distribution combination"
+        fi
+
+    - name: Upload image URL artifact
+      uses: actions/upload-artifact@v4
+      if: ${{ inputs.publish_image == 'true' && contains(fromJSON('["amd64", "arm64"]'), steps.platform.outputs.display_name) }}
+      with:
+        name: image-url-${{ inputs.distribution }}-${{ steps.platform.outputs.display_name }}
+        path: /tmp/image-urls/${{ inputs.distribution }}-${{ steps.platform.outputs.display_name }}.txt
+        retention-days: 1
